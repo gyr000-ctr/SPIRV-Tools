@@ -248,6 +248,50 @@ spv_result_t ValidateSwitch(ValidationState_t& _, const Instruction* inst) {
     }
   }
 
+  // The universal validation rules state that "It is invalid for any two
+  // literal to be equal to each other". This is only enforced for SPIR-V 1.6
+  // and later to preserve the behavior of earlier versions. Each literal is
+  // interpreted with the type of the selector, so the comparison must use the
+  // selector's bit width and signedness (a 64-bit selector has two-word
+  // literals, and narrow literals are sign-extended when signed).
+  if (_.version() >= SPV_SPIRV_VERSION_WORD(1, 6) && num_operands > 2) {
+    const auto sel_type = _.FindDef(sel_type_id);
+    uint32_t width = 32;
+    bool is_signed = false;
+    if (sel_type && sel_type->opcode() == spv::Op::OpTypeInt) {
+      // Operand 0 is the result id; operands 1 and 2 are the width and
+      // signedness, respectively.
+      width = sel_type->GetOperandAs<uint32_t>(1);
+      is_signed = sel_type->GetOperandAs<uint32_t>(2) != 0;
+    }
+    // Literals wider than 64 bits (e.g. from
+    // SPV_INTEL_arbitrary_precision_integers) cannot be canonicalized into
+    // 64 bits; skip the check rather than risk a false positive.
+    if (width <= 64) {
+      std::unordered_set<uint64_t> seen_literals;
+      for (size_t i = 2; i < num_operands; i += 2) {
+        const auto& literal = inst->operand(i);
+        uint64_t value = 0;
+        for (uint32_t w = 0; w < literal.num_words && w < 2; ++w) {
+          value |= static_cast<uint64_t>(inst->word(literal.offset + w))
+                   << (32 * w);
+        }
+        if (width < 64) {
+          const uint64_t mask = (uint64_t(1) << width) - 1;
+          value &= mask;
+          if (is_signed && (value & (uint64_t(1) << (width - 1)))) {
+            value |= ~mask;
+          }
+        }
+        if (!seen_literals.insert(value).second) {
+          return _.diag(SPV_ERROR_INVALID_ID, inst)
+                 << "In SPIR-V 1.6 or later, OpSwitch literals must be "
+                    "unique";
+        }
+      }
+    }
+  }
+
   return SPV_SUCCESS;
 }
 

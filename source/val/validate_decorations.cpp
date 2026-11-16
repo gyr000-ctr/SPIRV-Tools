@@ -793,6 +793,53 @@ spv_result_t CheckDecorationsCompatibility(ValidationState_t& vstate) {
                  << " is not allowed.";
         }
       }
+    } else if (spv::Op::OpGroupDecorate == inst.opcode() &&
+               vstate.version() >= SPV_SPIRV_VERSION_WORD(1, 6)) {
+      // SPIR-V 1.6 (revision 1, Khronos issue #695) clarified that "It is
+      // invalid to decorate any given <id> or structure member more than one
+      // time with the same decoration". This also covers decorations applied
+      // to a target through a decoration group. Only enforced for SPIR-V 1.6
+      // and later to preserve the behavior of earlier versions.
+      const auto group_id = words[1];
+      const auto& group_decorations = vstate.id_decorations(group_id);
+      for (size_t word_idx = 2; word_idx < words.size(); ++word_idx) {
+        const auto target_id = words[word_idx];
+        for (const auto& dec : group_decorations) {
+          const auto dec_type = dec.dec_type();
+          if (!AtMostOncePerId(dec_type)) continue;
+          const auto k = PerIDKey(dec_type, target_id);
+          if (!seen_per_id.insert(k).second) {
+            return vstate.diag(SPV_ERROR_INVALID_ID,
+                               vstate.FindDef(target_id))
+                   << "ID '" << target_id << "' decorated with "
+                   << vstate.SpvDecorationString(dec_type)
+                   << " multiple times is not allowed.";
+          }
+        }
+      }
+    } else if (spv::Op::OpGroupMemberDecorate == inst.opcode() &&
+               vstate.version() >= SPV_SPIRV_VERSION_WORD(1, 6)) {
+      // See the OpGroupDecorate case above.
+      const auto group_id = words[1];
+      const auto& group_decorations = vstate.id_decorations(group_id);
+      // Grammar checks ensure an odd number of words: 1 group <id> followed
+      // by (id, literal) pairs.
+      for (size_t word_idx = 2; word_idx + 1 < words.size(); word_idx += 2) {
+        const auto id = words[word_idx];
+        const auto member_id = words[word_idx + 1];
+        for (const auto& dec : group_decorations) {
+          const auto dec_type = dec.dec_type();
+          if (!AtMostOncePerMember(dec_type)) continue;
+          const auto k = PerMemberKey(dec_type, id, member_id);
+          if (!seen_per_member.insert(k).second) {
+            return vstate.diag(SPV_ERROR_INVALID_ID, vstate.FindDef(id))
+                   << "ID '" << id << "', member '" << member_id
+                   << "' decorated with "
+                   << vstate.SpvDecorationString(dec_type)
+                   << " multiple times is not allowed.";
+          }
+        }
+      }
     }
   }
   return SPV_SUCCESS;

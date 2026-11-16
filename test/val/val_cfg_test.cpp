@@ -4783,6 +4783,207 @@ OpFunctionEnd
                         "must be different labels"));
 }
 
+TEST_F(ValidateCFG, SwitchDuplicateLiteralPre1p6) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpMemoryModel Logical GLSL450
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%zero = OpConstant %uint 0
+%void_fn = OpTypeFunction %void
+%func = OpFunction %void None %void_fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %zero %merge 0 %case1 0 %case2
+%case1 = OpLabel
+OpBranch %merge
+%case2 = OpLabel
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  // Duplicate literals are only diagnosed for SPIR-V 1.6 and later.
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_5);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_5));
+}
+
+TEST_F(ValidateCFG, SwitchDuplicateLiteralPost1p6) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpMemoryModel Logical GLSL450
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%zero = OpConstant %uint 0
+%void_fn = OpTypeFunction %void
+%func = OpFunction %void None %void_fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %zero %merge 0 %case1 0 %case2
+%case1 = OpLabel
+OpBranch %merge
+%case2 = OpLabel
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(
+      getDiagnosticString(),
+      HasSubstr("In SPIR-V 1.6 or later, OpSwitch literals must be unique"));
+}
+
+TEST_F(ValidateCFG, SwitchUniqueLiteralsPost1p6) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpMemoryModel Logical GLSL450
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%zero = OpConstant %uint 0
+%void_fn = OpTypeFunction %void
+%func = OpFunction %void None %void_fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %zero %merge 0 %case1 1 %case2 2 %case3
+%case1 = OpLabel
+OpBranch %merge
+%case2 = OpLabel
+OpBranch %merge
+%case3 = OpLabel
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateCFG, SwitchDuplicateLiteral64Bit) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpCapability Int64
+OpMemoryModel Logical GLSL450
+%void = OpTypeVoid
+%ulong = OpTypeInt 64 0
+%zero = OpConstant %ulong 0
+%void_fn = OpTypeFunction %void
+%func = OpFunction %void None %void_fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %zero %merge 4294967296 %case1 4294967296 %case2
+%case1 = OpLabel
+OpBranch %merge
+%case2 = OpLabel
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(
+      getDiagnosticString(),
+      HasSubstr("In SPIR-V 1.6 or later, OpSwitch literals must be unique"));
+}
+
+TEST_F(ValidateCFG, SwitchDistinctHighWordLiterals64Bit) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpCapability Int64
+OpMemoryModel Logical GLSL450
+%void = OpTypeVoid
+%ulong = OpTypeInt 64 0
+%zero = OpConstant %ulong 0
+%void_fn = OpTypeFunction %void
+%func = OpFunction %void None %void_fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %zero %merge 0 %case1 4294967296 %case2
+%case1 = OpLabel
+OpBranch %merge
+%case2 = OpLabel
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  // The low 32 bits of both literals are zero, but the 64-bit values differ.
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateCFG, SwitchDuplicateLiteralSigned16Bit) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpCapability Int16
+OpMemoryModel Logical GLSL450
+%void = OpTypeVoid
+%short = OpTypeInt 16 1
+%zero = OpConstant %short 0
+%void_fn = OpTypeFunction %void
+%func = OpFunction %void None %void_fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %zero %merge 0xFFFF %case1 -1 %case2
+%case1 = OpLabel
+OpBranch %merge
+%case2 = OpLabel
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  // 0xFFFF and -1 are the same value when interpreted as a signed 16-bit
+  // integer.
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(
+      getDiagnosticString(),
+      HasSubstr("In SPIR-V 1.6 or later, OpSwitch literals must be unique"));
+}
+
+TEST_F(ValidateCFG, SwitchDistinctLiteralsSigned16Bit) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpCapability Int16
+OpMemoryModel Logical GLSL450
+%void = OpTypeVoid
+%short = OpTypeInt 16 1
+%zero = OpConstant %short 0
+%void_fn = OpTypeFunction %void
+%func = OpFunction %void None %void_fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %zero %merge 0xFFFF %case1 1 %case2
+%case1 = OpLabel
+OpBranch %merge
+%case2 = OpLabel
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
 TEST_F(ValidateCFG, BadBackEdgeUnreachableContinue) {
   const std::string text = R"(
 OpCapability Shader

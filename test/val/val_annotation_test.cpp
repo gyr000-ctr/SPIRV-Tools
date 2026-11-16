@@ -1177,6 +1177,93 @@ INSTANTIATE_TEST_SUITE_P(ValidateVulkanInterpolationStorageClass,
                          VulkanInterpolationStorageClass,
                          Values("Flat", "NoPerspective", "Centroid", "Sample"));
 
+TEST_F(DecorationTest, DuplicateDecorationViaGroupPre1p6) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpMemoryModel Logical GLSL450
+OpDecorate %group NoPerspective
+OpDecorate %var NoPerspective
+%group = OpDecorationGroup
+OpGroupDecorate %group %var
+%void = OpTypeVoid
+%float = OpTypeFloat 32
+%ptr = OpTypePointer Input %float
+%var = OpVariable %ptr Input
+)";
+
+  // NoPerspective is applied to %var both directly and through the
+  // decoration group. Duplicates applied through a decoration group are
+  // only diagnosed for SPIR-V 1.6 and later.
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_5);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_5));
+}
+
+TEST_F(DecorationTest, DuplicateDecorationViaGroupPost1p6) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpMemoryModel Logical GLSL450
+OpDecorate %group NoPerspective
+OpDecorate %var NoPerspective
+%group = OpDecorationGroup
+OpGroupDecorate %group %var
+%void = OpTypeVoid
+%float = OpTypeFloat 32
+%ptr = OpTypePointer Input %float
+%var = OpVariable %ptr Input
+)";
+
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("decorated with NoPerspective multiple times is not "
+                        "allowed"));
+}
+
+TEST_F(DecorationTest, DuplicateMemberDecorationViaGroupPost1p6) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpMemoryModel Logical GLSL450
+OpDecorate %group Offset 0
+OpMemberDecorate %struct 0 Offset 0
+%group = OpDecorationGroup
+OpGroupMemberDecorate %group %struct 0
+%void = OpTypeVoid
+%float = OpTypeFloat 32
+%struct = OpTypeStruct %float
+)";
+
+  // Offset 0 is applied to member 0 of %struct both directly and through
+  // the decoration group.
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("decorated with Offset multiple times is not "
+                        "allowed"));
+}
+
+TEST_F(DecorationTest, DistinctDecorationViaGroupPost1p6) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpMemoryModel Logical GLSL450
+OpDecorate %group NoPerspective
+OpDecorate %var Location 0
+%group = OpDecorationGroup
+OpGroupDecorate %group %var
+%void = OpTypeVoid
+%float = OpTypeFloat 32
+%ptr = OpTypePointer Input %float
+%var = OpVariable %ptr Input
+)";
+
+  // Different decorations applied directly and through a group are valid.
+  CompileSuccessfully(text, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
 }  // namespace
 }  // namespace val
 }  // namespace spvtools
