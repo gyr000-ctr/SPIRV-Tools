@@ -16,6 +16,9 @@
 
 #include "convert_to_half_pass.h"
 
+#include <string>
+#include <vector>
+
 #include "source/opt/ir_builder.h"
 
 namespace spvtools {
@@ -32,6 +35,15 @@ bool ConvertToHalfPass::IsArithmetic(Instruction* inst) {
           inst->GetSingleWordInOperand(0) ==
               context()->get_feature_mgr()->GetExtInstImportId_GLSLstd450() &&
           target_ops_450_.count(inst->GetSingleWordInOperand(1)) != 0);
+}
+
+bool ConvertToHalfPass::IsStructExtInst(Instruction* inst) {
+  if (inst->opcode() != spv::Op::OpExtInst) return false;
+  if (inst->GetSingleWordInOperand(0) !=
+      context()->get_feature_mgr()->GetExtInstImportId_GLSLstd450())
+    return false;
+  uint32_t ext_op = inst->GetSingleWordInOperand(1);
+  return ext_op == GLSLstd450ModfStruct || ext_op == GLSLstd450FrexpStruct;
 }
 
 bool ConvertToHalfPass::IsFloat(Instruction* inst, uint32_t width) {
@@ -251,6 +263,144 @@ bool ConvertToHalfPass::GenHalfArith(Instruction* inst) {
   return modified;
 }
 
+bool ConvertToHalfPass::GenHalfStructExtInst(Instruction* inst) {
+  const std::string ext_name =
+      inst->GetSingleWordInOperand(1) == GLSLstd450ModfStruct ? "ModfStruct"
+                                                              : "FrexpStruct";
+  const std::string err_prefix =
+      "ConvertToHalfPass: " + ext_name + ": ";
+  // The result type must be a struct.
+  Instruction* struct_ty_inst = get_def_use_mgr()->GetDef(inst->type_id());
+  if (struct_ty_inst->opcode() != spv::Op::OpTypeStruct) {
+    context()->consumer()(SPV_MSG_ERROR, "", {0, 0, 0},
+                          (err_prefix + "result type is not a struct").c_str());
+    status_ = Status::Failure;
+    return false;
+  }
+  // Determine the float32 type of the argument. The argument may already
+  // have been converted to float16 by a relaxed producer; in that case use
+  // its float32 equivalent as the reference type for the struct members.
+  // If the argument is not 16- or 32-bit float based (eg. 64-bit), there is
+  // nothing to convert.
+  uint32_t arg_id = inst->GetSingleWordInOperand(2);
+  Instruction* arg_inst = get_def_use_mgr()->GetDef(arg_id);
+  uint32_t orig_arg_ty_id;
+  if (IsFloat(arg_inst, 32)) {
+    orig_arg_ty_id = arg_inst->type_id();
+  } else if (IsFloat(arg_inst, 16)) {
+    orig_arg_ty_id = EquivFloatTypeId(arg_inst->type_id(), 32);
+    if (orig_arg_ty_id == 0) {
+      status_ = Status::Failure;
+      return false;
+    }
+  } else {
+    return false;
+  }
+  // Check each member of the struct and compute its half-precision
+  // equivalent. Float32 members must be consistent with the argument type.
+  // Non-float members (such as the FrexpStruct exponent) must be integer
+  // scalar or vector types and are left unchanged. If there are no float32
+  // members, there is nothing to convert.
+  const uint32_t num_members = struct_ty_inst->NumInOperands();
+  std::vector<uint32_t> half_member_ty_ids(num_members);
+  bool has_float_member = false;
+  for (uint32_t i = 0; i < num_members; ++i) {
+    uint32_t member_ty_id = struct_ty_inst->GetSingleWordInOperand(i);
+    if (Pass::IsFloat(member_ty_id, 32)) {
+      has_float_member = true;
+      if (member_ty_id != orig_arg_ty_id) {
+        context()->consumer()(
+            SPV_MSG_ERROR, "", {0, 0, 0},
+            (err_prefix +
+             "struct member types are inconsistent with the argument type")
+                .c_str());
+        status_ = Status::Failure;
+        return false;
+      }
+      uint32_t half_ty_id = EquivFloatTypeId(member_ty_id, 16);
+      if (half_ty_id == 0) {
+        status_ = Status::Failure;
+        return false;
+      }
+      half_member_ty_ids[i] = half_ty_id;
+    } else {
+      Instruction* member_ty_inst = get_def_use_mgr()->GetDef(member_ty_id);
+      Instruction* base_ty_inst = Pass::GetBaseType(member_ty_id);
+      if (member_ty_inst->opcode() == spv::Op::OpTypeMatrix ||
+          base_ty_inst->opcode() != spv::Op::OpTypeInt) {
+        context()->consumer()(
+            SPV_MSG_ERROR, "", {0, 0, 0},
+            (err_prefix + "struct member has an invalid type").c_str());
+        status_ = Status::Failure;
+        return false;
+      }
+      half_member_ty_ids[i] = member_ty_id;
+    }
+  }
+  if (!has_float_member) return false;
+  // All users of the struct result must be OpCompositeExtract instructions
+  // so that the struct is consumed member by member. Users not in a
+  // function body (eg. OpDecorate, OpName) are ignored.
+  bool extracts_only = true;
+  get_def_use_mgr()->ForEachUser(inst, [&extracts_only, this](Instruction* u) {
+    if (context()->get_instr_block(u) == nullptr) return;
+    if (u->opcode() != spv::Op::OpCompositeExtract) extracts_only = false;
+  });
+  if (!extracts_only) {
+    context()->consumer()(
+        SPV_MSG_ERROR, "", {0, 0, 0},
+        (err_prefix +
+         "struct result is partially consumed by an instruction other than "
+         "OpCompositeExtract")
+            .c_str());
+    status_ = Status::Failure;
+    return false;
+  }
+  // Get or create the half-precision struct type.
+  analysis::TypeManager* type_mgr = context()->get_type_mgr();
+  std::vector<const analysis::Type*> half_member_types;
+  for (uint32_t i = 0; i < num_members; ++i) {
+    half_member_types.push_back(type_mgr->GetType(half_member_ty_ids[i]));
+  }
+  analysis::Struct half_struct_ty(half_member_types);
+  uint32_t half_struct_ty_id = type_mgr->GetTypeInstruction(&half_struct_ty);
+  if (half_struct_ty_id == 0) {
+    status_ = Status::Failure;
+    return false;
+  }
+  // Convert the argument to half precision (a no-op if it already is) and
+  // change the result type of the instruction to the half-precision struct.
+  GenConvert(&arg_id, 16, inst);
+  if (status_ == Status::Failure) return false;
+  inst->SetInOperand(2, {arg_id});
+  inst->SetResultType(half_struct_ty_id);
+  get_def_use_mgr()->AnalyzeInstUse(inst);
+  // Rewrite each OpCompositeExtract user to extract from the half-precision
+  // struct. There may be multiple extracts of the same or different
+  // members. Extracts of converted members are remembered so that their
+  // non-relaxed users get converted back to 32-bit floats.
+  std::vector<Instruction*> extract_users;
+  get_def_use_mgr()->ForEachUser(inst, [&extract_users, this](Instruction* u) {
+    if (context()->get_instr_block(u) != nullptr) extract_users.push_back(u);
+  });
+  for (Instruction* user : extract_users) {
+    // Walk the half-precision type hierarchy along the extract indices to
+    // find the extracted type.
+    uint32_t ty_id = half_struct_ty_id;
+    for (uint32_t i = 1; i < user->NumInOperands(); ++i) {
+      Instruction* ty_inst = get_def_use_mgr()->GetDef(ty_id);
+      uint32_t idx = user->GetSingleWordInOperand(i);
+      if (ty_inst->opcode() != spv::Op::OpTypeStruct) idx = 0;
+      ty_id = ty_inst->GetSingleWordInOperand(idx);
+    }
+    if (ty_id == user->type_id()) continue;
+    user->SetResultType(ty_id);
+    converted_ids_.insert(user->result_id());
+    get_def_use_mgr()->AnalyzeInstUse(user);
+  }
+  return true;
+}
+
 bool ConvertToHalfPass::ProcessPhi(Instruction* inst, uint32_t from_width,
                                    uint32_t to_width) {
   // Add converts of any float operands to to_width if they are of from_width.
@@ -380,9 +530,12 @@ bool ConvertToHalfPass::GenHalfInst(Instruction* inst) {
   bool modified = false;
   // Remember id for later deletion of RelaxedPrecision decoration
   bool inst_relaxed = IsRelaxed(inst->result_id());
-  if (IsArithmetic(inst) && inst_relaxed)
-    modified = GenHalfArith(inst);
-  else if (inst->opcode() == spv::Op::OpPhi && inst_relaxed)
+  if (IsArithmetic(inst) && inst_relaxed) {
+    if (IsStructExtInst(inst))
+      modified = GenHalfStructExtInst(inst);
+    else
+      modified = GenHalfArith(inst);
+  } else if (inst->opcode() == spv::Op::OpPhi && inst_relaxed)
     modified = ProcessPhi(inst, 32u, 16u);
   else if (inst->opcode() == spv::Op::OpFConvert)
     modified = ProcessConvert(inst);
@@ -396,6 +549,16 @@ bool ConvertToHalfPass::GenHalfInst(Instruction* inst) {
 bool ConvertToHalfPass::CloseRelaxInst(Instruction* inst) {
   if (inst->result_id() == 0) return false;
   if (IsRelaxed(inst->result_id())) return false;
+  // Struct-returning extended instructions are not float, so they can only
+  // be relaxed through an explicit RelaxedPrecision decoration. They are
+  // converted member by member in GenHalfStructExtInst.
+  if (IsStructExtInst(inst)) {
+    if (IsDecoratedRelaxed(inst)) {
+      AddRelaxed(inst->result_id());
+      return true;
+    }
+    return false;
+  }
   if (!IsFloat(inst, 32)) return false;
   if (IsDecoratedRelaxed(inst)) {
     AddRelaxed(inst->result_id());
@@ -563,11 +726,10 @@ void ConvertToHalfPass::Initialize() {
       GLSLstd450Acosh, GLSLstd450Atanh, GLSLstd450Atan2, GLSLstd450Pow,
       GLSLstd450Exp, GLSLstd450Log, GLSLstd450Exp2, GLSLstd450Log2,
       GLSLstd450Sqrt, GLSLstd450InverseSqrt, GLSLstd450Determinant,
-      GLSLstd450MatrixInverse,
-      // TODO(greg-lunarg): GLSLstd450ModfStruct,
+      GLSLstd450MatrixInverse, GLSLstd450ModfStruct,
       GLSLstd450FMin, GLSLstd450FMax, GLSLstd450FClamp, GLSLstd450FMix,
       GLSLstd450Step, GLSLstd450SmoothStep, GLSLstd450Fma,
-      // TODO(greg-lunarg): GLSLstd450FrexpStruct,
+      GLSLstd450FrexpStruct,
       GLSLstd450Ldexp, GLSLstd450Length, GLSLstd450Distance, GLSLstd450Cross,
       GLSLstd450Normalize, GLSLstd450FaceForward, GLSLstd450Reflect,
       GLSLstd450Refract, GLSLstd450NMin, GLSLstd450NMax, GLSLstd450NClamp};

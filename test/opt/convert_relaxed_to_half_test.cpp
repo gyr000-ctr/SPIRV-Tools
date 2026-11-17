@@ -1816,6 +1816,385 @@ OpFunctionEnd
   SinglePassRunAndCheck<ConvertToHalfPass>(text, text, true, true);
 }
 
+TEST_F(ConvertToHalfTest, ConvertToHalfModfStruct) {
+  // A relaxed ModfStruct should have its argument and both struct members
+  // converted to half precision, member by member.
+  const std::string test = R"(
+               OpCapability Shader
+               OpCapability Float16
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %4 "main" %out_var
+               OpExecutionMode %4 OriginUpperLeft
+               OpDecorate %out_var Location 0
+               OpDecorate %modf_res RelaxedPrecision
+               OpDecorate %add RelaxedPrecision
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+;CHECK: [[float:%\w+]] = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+;CHECK: [[v2float:%\w+]] = OpTypeVector [[float]] 2
+%_ptr_Output_v2float = OpTypePointer Output %v2float
+    %out_var = OpVariable %_ptr_Output_v2float Output
+     %modf_t = OpTypeStruct %v2float %v2float
+  %float_1_5 = OpConstant %float 1.5
+ %float_n2_5 = OpConstant %float -2.5
+     %in_val = OpConstantComposite %v2float %float_1_5 %float_n2_5
+       %half = OpTypeFloat 16
+;CHECK: [[half:%\w+]] = OpTypeFloat 16
+     %v2half = OpTypeVector %half 2
+;CHECK: [[v2half:%\w+]] = OpTypeVector [[half]] 2
+;CHECK: [[half_struct:%\w+]] = OpTypeStruct [[v2half]] [[v2half]]
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+;CHECK: [[arg:%\w+]] = OpFConvert [[v2half]]
+   %modf_res = OpExtInst %modf_t %1 ModfStruct %in_val
+;CHECK: [[modf:%\w+]] = OpExtInst [[half_struct]] {{%\w+}} ModfStruct [[arg]]
+      %fract = OpCompositeExtract %v2float %modf_res 0
+;CHECK: [[fract:%\w+]] = OpCompositeExtract [[v2half]] [[modf]] 0
+      %whole = OpCompositeExtract %v2float %modf_res 1
+;CHECK: [[whole:%\w+]] = OpCompositeExtract [[v2half]] [[modf]] 1
+         %add = OpFAdd %v2float %fract %whole
+;CHECK: [[add:%\w+]] = OpFAdd [[v2half]] [[fract]] [[whole]]
+;CHECK: [[add32:%\w+]] = OpFConvert [[v2float]] [[add]]
+               OpStore %out_var %add
+;CHECK: OpStore {{%\w+}} [[add32]]
+               OpReturn
+               OpFunctionEnd
+  )";
+
+  SinglePassRunAndMatch<ConvertToHalfPass>(test, true);
+}
+
+TEST_F(ConvertToHalfTest, ConvertToHalfFrexpStruct) {
+  // A relaxed FrexpStruct should have its argument and the mantissa struct
+  // member converted to half precision. The integer exponent member must be
+  // left unchanged.
+  const std::string test = R"(
+               OpCapability Shader
+               OpCapability Float16
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %4 "main" %out_var %out_exp
+               OpExecutionMode %4 OriginUpperLeft
+               OpDecorate %out_var Location 0
+               OpDecorate %out_exp Location 1
+               OpDecorate %frexp_res RelaxedPrecision
+               OpDecorate %add RelaxedPrecision
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+;CHECK: [[float:%\w+]] = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+;CHECK: [[v4float:%\w+]] = OpTypeVector [[float]] 4
+        %int = OpTypeInt 32 1
+      %v4int = OpTypeVector %int 4
+;CHECK: [[v4int:%\w+]] = OpTypeVector {{%\w+}} 4
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%_ptr_Output_v4int = OpTypePointer Output %v4int
+    %out_var = OpVariable %_ptr_Output_v4float Output
+    %out_exp = OpVariable %_ptr_Output_v4int Output
+    %frexp_t = OpTypeStruct %v4float %v4int
+  %float_1_5 = OpConstant %float 1.5
+     %in_val = OpConstantComposite %v4float %float_1_5 %float_1_5 %float_1_5 %float_1_5
+       %half = OpTypeFloat 16
+;CHECK: [[half:%\w+]] = OpTypeFloat 16
+     %v4half = OpTypeVector %half 4
+;CHECK: [[v4half:%\w+]] = OpTypeVector [[half]] 4
+;CHECK: [[half_struct:%\w+]] = OpTypeStruct [[v4half]] [[v4int]]
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+;CHECK: [[arg:%\w+]] = OpFConvert [[v4half]]
+  %frexp_res = OpExtInst %frexp_t %1 FrexpStruct %in_val
+;CHECK: [[frexp:%\w+]] = OpExtInst [[half_struct]] {{%\w+}} FrexpStruct [[arg]]
+        %man = OpCompositeExtract %v4float %frexp_res 0
+;CHECK: [[man:%\w+]] = OpCompositeExtract [[v4half]] [[frexp]] 0
+        %exp = OpCompositeExtract %v4int %frexp_res 1
+;CHECK: [[exp:%\w+]] = OpCompositeExtract [[v4int]] [[frexp]] 1
+         %add = OpFAdd %v4float %man %man
+;CHECK: [[add:%\w+]] = OpFAdd [[v4half]] [[man]] [[man]]
+;CHECK: [[add32:%\w+]] = OpFConvert [[v4float]] [[add]]
+               OpStore %out_var %add
+;CHECK: OpStore {{%\w+}} [[add32]]
+               OpStore %out_exp %exp
+               OpReturn
+               OpFunctionEnd
+  )";
+
+  SinglePassRunAndMatch<ConvertToHalfPass>(test, true);
+}
+
+TEST_F(ConvertToHalfTest, ConvertToHalfModfStructMultipleUses) {
+  // The struct result is consumed by multiple OpCompositeExtract
+  // instructions, including two extracts of the same member. All extracts
+  // must be rewritten to the half-precision member types.
+  const std::string test = R"(
+               OpCapability Shader
+               OpCapability Float16
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %4 "main" %out_var
+               OpExecutionMode %4 OriginUpperLeft
+               OpDecorate %out_var Location 0
+               OpDecorate %modf_res RelaxedPrecision
+               OpDecorate %add RelaxedPrecision
+               OpDecorate %mul RelaxedPrecision
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+;CHECK: [[v2float:%\w+]] = OpTypeVector {{%\w+}} 2
+%_ptr_Output_v2float = OpTypePointer Output %v2float
+    %out_var = OpVariable %_ptr_Output_v2float Output
+     %modf_t = OpTypeStruct %v2float %v2float
+  %float_1_5 = OpConstant %float 1.5
+     %in_val = OpConstantComposite %v2float %float_1_5 %float_1_5
+       %half = OpTypeFloat 16
+     %v2half = OpTypeVector %half 2
+;CHECK: [[v2half:%\w+]] = OpTypeVector {{%\w+}} 2
+;CHECK: [[half_struct:%\w+]] = OpTypeStruct [[v2half]] [[v2half]]
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+   %modf_res = OpExtInst %modf_t %1 ModfStruct %in_val
+;CHECK: [[modf:%\w+]] = OpExtInst [[half_struct]] {{%\w+}} ModfStruct {{%\w+}}
+     %fract0 = OpCompositeExtract %v2float %modf_res 0
+;CHECK: [[fract0:%\w+]] = OpCompositeExtract [[v2half]] [[modf]] 0
+     %fract1 = OpCompositeExtract %v2float %modf_res 0
+;CHECK: [[fract1:%\w+]] = OpCompositeExtract [[v2half]] [[modf]] 0
+      %whole = OpCompositeExtract %v2float %modf_res 1
+;CHECK: [[whole:%\w+]] = OpCompositeExtract [[v2half]] [[modf]] 1
+         %add = OpFAdd %v2float %fract0 %whole
+;CHECK: [[add:%\w+]] = OpFAdd [[v2half]] [[fract0]] [[whole]]
+         %mul = OpFMul %v2float %fract1 %add
+;CHECK: [[mul:%\w+]] = OpFMul [[v2half]] [[fract1]] [[add]]
+;CHECK: [[mul32:%\w+]] = OpFConvert [[v2float]] [[mul]]
+               OpStore %out_var %mul
+;CHECK: OpStore {{%\w+}} [[mul32]]
+               OpReturn
+               OpFunctionEnd
+  )";
+
+  SinglePassRunAndMatch<ConvertToHalfPass>(test, true);
+}
+
+TEST_F(ConvertToHalfTest, ConvertToHalfFrexpStructMultipleUses) {
+  // The struct result is consumed by multiple OpCompositeExtract
+  // instructions. Extracts of the integer exponent member must keep their
+  // integer type.
+  const std::string test = R"(
+               OpCapability Shader
+               OpCapability Float16
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %4 "main" %out_var %out_exp
+               OpExecutionMode %4 OriginUpperLeft
+               OpDecorate %out_var Location 0
+               OpDecorate %out_exp Location 1
+               OpDecorate %frexp_res RelaxedPrecision
+               OpDecorate %add RelaxedPrecision
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+;CHECK: [[v2float:%\w+]] = OpTypeVector {{%\w+}} 2
+        %int = OpTypeInt 32 1
+      %v2int = OpTypeVector %int 2
+;CHECK: [[v2int:%\w+]] = OpTypeVector {{%\w+}} 2
+%_ptr_Output_v2float = OpTypePointer Output %v2float
+%_ptr_Output_v2int = OpTypePointer Output %v2int
+    %out_var = OpVariable %_ptr_Output_v2float Output
+    %out_exp = OpVariable %_ptr_Output_v2int Output
+    %frexp_t = OpTypeStruct %v2float %v2int
+  %float_1_5 = OpConstant %float 1.5
+     %in_val = OpConstantComposite %v2float %float_1_5 %float_1_5
+       %half = OpTypeFloat 16
+     %v2half = OpTypeVector %half 2
+;CHECK: [[v2half:%\w+]] = OpTypeVector {{%\w+}} 2
+;CHECK: [[half_struct:%\w+]] = OpTypeStruct [[v2half]] [[v2int]]
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+  %frexp_res = OpExtInst %frexp_t %1 FrexpStruct %in_val
+;CHECK: [[frexp:%\w+]] = OpExtInst [[half_struct]] {{%\w+}} FrexpStruct {{%\w+}}
+       %man0 = OpCompositeExtract %v2float %frexp_res 0
+;CHECK: [[man0:%\w+]] = OpCompositeExtract [[v2half]] [[frexp]] 0
+       %man1 = OpCompositeExtract %v2float %frexp_res 0
+;CHECK: [[man1:%\w+]] = OpCompositeExtract [[v2half]] [[frexp]] 0
+       %exp0 = OpCompositeExtract %v2int %frexp_res 1
+;CHECK: [[exp0:%\w+]] = OpCompositeExtract [[v2int]] [[frexp]] 1
+       %exp1 = OpCompositeExtract %v2int %frexp_res 1
+;CHECK: [[exp1:%\w+]] = OpCompositeExtract [[v2int]] [[frexp]] 1
+         %add = OpFAdd %v2float %man0 %man1
+;CHECK: [[add:%\w+]] = OpFAdd [[v2half]] [[man0]] [[man1]]
+      %eadd = OpIAdd %v2int %exp0 %exp1
+;CHECK: OpIAdd [[v2int]] [[exp0]] [[exp1]]
+;CHECK: [[add32:%\w+]] = OpFConvert [[v2float]] [[add]]
+               OpStore %out_var %add
+               OpStore %out_exp %eadd
+               OpReturn
+               OpFunctionEnd
+  )";
+
+  SinglePassRunAndMatch<ConvertToHalfPass>(test, true);
+}
+
+TEST_F(ConvertToHalfTest, ConvertToHalfModfStructNotRelaxed) {
+  // A ModfStruct without RelaxedPrecision must be left alone, even if the
+  // arithmetic consuming the extracts of its result is relaxed.
+  const std::string test = R"(
+               OpCapability Shader
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %4 "main" %out_var
+               OpExecutionMode %4 OriginUpperLeft
+               OpDecorate %out_var Location 0
+               OpDecorate %add RelaxedPrecision
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+;CHECK: [[v2float:%\w+]] = OpTypeVector {{%\w+}} 2
+%_ptr_Output_v2float = OpTypePointer Output %v2float
+    %out_var = OpVariable %_ptr_Output_v2float Output
+     %modf_t = OpTypeStruct %v2float %v2float
+;CHECK: [[modf_t:%\w+]] = OpTypeStruct [[v2float]] [[v2float]]
+  %float_1_5 = OpConstant %float 1.5
+     %in_val = OpConstantComposite %v2float %float_1_5 %float_1_5
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+   %modf_res = OpExtInst %modf_t %1 ModfStruct %in_val
+;CHECK: [[modf:%\w+]] = OpExtInst [[modf_t]] {{%\w+}} ModfStruct {{%\w+}}
+      %fract = OpCompositeExtract %v2float %modf_res 0
+;CHECK: OpCompositeExtract [[v2float]] [[modf]] 0
+      %whole = OpCompositeExtract %v2float %modf_res 1
+;CHECK: OpCompositeExtract [[v2float]] [[modf]] 1
+         %add = OpFAdd %v2float %fract %whole
+               OpStore %out_var %add
+               OpReturn
+               OpFunctionEnd
+  )";
+
+  SinglePassRunAndMatch<ConvertToHalfPass>(test, true);
+}
+
+TEST_F(ConvertToHalfTest, ConvertToHalfModfStructInconsistentMemberTypes) {
+  // The float members of the result struct must be consistent with the
+  // argument type.
+  const std::string test = R"(
+               OpCapability Shader
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %4 "main"
+               OpExecutionMode %4 OriginUpperLeft
+               OpDecorate %modf_res RelaxedPrecision
+;CHECK: ModfStruct: struct member types are inconsistent with the argument type
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+     %modf_t = OpTypeStruct %v2float %float
+  %float_1_5 = OpConstant %float 1.5
+     %in_val = OpConstantComposite %v2float %float_1_5 %float_1_5
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+   %modf_res = OpExtInst %modf_t %1 ModfStruct %in_val
+      %fract = OpCompositeExtract %v2float %modf_res 0
+               OpReturn
+               OpFunctionEnd
+  )";
+
+  SinglePassRunAndFail<ConvertToHalfPass>(test);
+}
+
+TEST_F(ConvertToHalfTest, ConvertToHalfFrexpStructInvalidMemberType) {
+  // A non-float member that is not an integer scalar or vector (eg. the
+  // FrexpStruct exponent) is invalid.
+  const std::string test = R"(
+               OpCapability Shader
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %4 "main"
+               OpExecutionMode %4 OriginUpperLeft
+               OpDecorate %frexp_res RelaxedPrecision
+;CHECK: FrexpStruct: struct member has an invalid type
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+       %bool = OpTypeBool
+     %v2bool = OpTypeVector %bool 2
+    %frexp_t = OpTypeStruct %v2float %v2bool
+  %float_1_5 = OpConstant %float 1.5
+     %in_val = OpConstantComposite %v2float %float_1_5 %float_1_5
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+  %frexp_res = OpExtInst %frexp_t %1 FrexpStruct %in_val
+        %man = OpCompositeExtract %v2float %frexp_res 0
+               OpReturn
+               OpFunctionEnd
+  )";
+
+  SinglePassRunAndFail<ConvertToHalfPass>(test);
+}
+
+TEST_F(ConvertToHalfTest, ConvertToHalfModfStructResultNotStruct) {
+  // The result type of a ModfStruct instruction must be a struct.
+  const std::string test = R"(
+               OpCapability Shader
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %4 "main"
+               OpExecutionMode %4 OriginUpperLeft
+               OpDecorate %modf_res RelaxedPrecision
+;CHECK: ModfStruct: result type is not a struct
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+  %float_1_5 = OpConstant %float 1.5
+     %in_val = OpConstantComposite %v2float %float_1_5 %float_1_5
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+   %modf_res = OpExtInst %v2float %1 ModfStruct %in_val
+               OpReturn
+               OpFunctionEnd
+  )";
+
+  SinglePassRunAndFail<ConvertToHalfPass>(test);
+}
+
+TEST_F(ConvertToHalfTest, ConvertToHalfModfStructPartiallyConsumed) {
+  // The struct result is consumed by an OpStore in addition to an
+  // OpCompositeExtract, so it cannot be converted member by member.
+  const std::string test = R"(
+               OpCapability Shader
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %4 "main"
+               OpExecutionMode %4 OriginUpperLeft
+               OpDecorate %modf_res RelaxedPrecision
+;CHECK: ModfStruct: struct result is partially consumed by an instruction other than OpCompositeExtract
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+     %modf_t = OpTypeStruct %v2float %v2float
+%_ptr_Function_modf_t = OpTypePointer Function %modf_t
+  %float_1_5 = OpConstant %float 1.5
+     %in_val = OpConstantComposite %v2float %float_1_5 %float_1_5
+          %4 = OpFunction %void None %3
+          %5 = OpLabel
+        %var = OpVariable %_ptr_Function_modf_t Function
+   %modf_res = OpExtInst %modf_t %1 ModfStruct %in_val
+      %fract = OpCompositeExtract %v2float %modf_res 0
+               OpStore %var %modf_res
+               OpReturn
+               OpFunctionEnd
+  )";
+
+  SinglePassRunAndFail<ConvertToHalfPass>(test);
+}
+
 }  // namespace
 }  // namespace opt
 }  // namespace spvtools

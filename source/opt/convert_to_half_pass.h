@@ -42,6 +42,10 @@ class ConvertToHalfPass : public Pass {
   // of type float16
   bool IsArithmetic(Instruction* inst);
 
+  // Return true if |inst| is a GLSL.std.450 ModfStruct or FrexpStruct
+  // extended instruction, which returns a struct.
+  bool IsStructExtInst(Instruction* inst);
+
   // Return true if |inst| returns scalar, vector or matrix type with base
   // float and |width|
   bool IsFloat(Instruction* inst, uint32_t width);
@@ -95,6 +99,16 @@ class ConvertToHalfPass : public Pass {
 
   // Gen code for relaxed arithmetic |inst|
   bool GenHalfArith(Instruction* inst);
+
+  // Gen code for relaxed ModfStruct/FrexpStruct |inst|. The float argument
+  // and each float member of the returned struct are converted to half
+  // precision member by member. All users of the struct result must be
+  // OpCompositeExtract instructions; they are rewritten to extract the
+  // half-precision member types. Reports a distinguishable error and fails
+  // if the struct members are inconsistent with the argument, if a member
+  // has an invalid type, or if the struct is (partially) consumed by an
+  // instruction other than OpCompositeExtract.
+  bool GenHalfStructExtInst(Instruction* inst);
 
   // Gen code for relaxed phi |inst|
   bool ProcessPhi(Instruction* inst, uint32_t from_width, uint32_t to_width);
