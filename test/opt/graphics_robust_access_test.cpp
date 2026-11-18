@@ -1694,14 +1694,362 @@ TEST_F(GraphicsRobustAccessTest, ReplaceIndexReportsChanged) {
 
 // TODO(dneto): Test access chain index wider than 64 bits?
 // TODO(dneto): Test struct access chain index wider than 64 bits?
-// TODO(dneto): OpImageTexelPointer
-//   - all Dim types: 1D 2D Cube 3D Rect Buffer
-//   - all Dim types that can be arrayed: 1D 2D 3D
-//   - sample index: set to 0 if not multisampled
-//   - Dim (2D, Cube Rect} with multisampling
-//      -1 0 max excess
-// TODO(dneto): Test OpImageTexelPointer with coordinate component index other
-// than 32 bits.
+// Returns the preamble for OpImageTexelPointer tests, with the given image
+// type declaration (e.g. "%img = OpTypeImage %uint 2D 0 0 0 2 R32ui").
+// The module declares a UniformConstant variable %var of the image type, a
+// coordinate %coord of the given coordinate type, and a sample index
+// %sample.  The body of the function is provided by the test.
+// |extra_types| is injected into the types section, and |extra_consts| into
+// the constants section.
+std::string ShaderPreambleITP(const std::string& image_type_decl,
+                              const std::string& coord_type,
+                              const std::string& extra_types = "",
+                              const std::string& extra_consts = "") {
+  return R"(OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpName %var "var"
+OpName %coord "coord"
+OpName %sample "sample"
+OpName %texel_ptr "texel_ptr"
+OpName %img "img"
+OpName %texel_ptr_ty "texel_ptr_ty"
+OpDecorate %var DescriptorSet 0
+OpDecorate %var Binding 0
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%v2int = OpTypeVector %int 2
+%v3int = OpTypeVector %int 3
+)" + extra_types + image_type_decl + R"(
+%img_ptr = OpTypePointer UniformConstant %img
+%texel_ptr_ty = OpTypePointer Image %uint
+%var = OpVariable %img_ptr UniformConstant
+%int_0 = OpConstant %int 0
+%int_1 = OpConstant %int 1
+%uint_0 = OpConstant %uint 0
+%uint_1 = OpConstant %uint 1
+)" + extra_consts + R"(
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+%coord = OpUndef )" + coord_type + R"(
+%sample = OpUndef %uint
+)";
+}
+
+std::string MainSuffixITP() {
+  return R"(%r = OpAtomicIAdd %uint %texel_ptr %uint_1 %uint_0 %uint_1
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointer1D) {
+  const std::string text =
+      R"(OpCapability Sampled1D
+; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 1D 0 0 0 2 R32ui", "%int") +
+      R"(; CHECK: %[[image:\w+]] = OpLoad %img %var
+; CHECK: %[[size:\w+]] = OpImageQuerySize %int %[[image]]
+; CHECK: %[[max:\w+]] = OpISub %int %[[size]] %int_1
+; CHECK: %[[clamp:\w+]] = OpExtInst %int %[[glsl]] SClamp %coord %int_0 %[[max]]
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %uint_0
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointer2D) {
+  const std::string text =
+      R"(; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+; CHECK: %[[ones:\w+]] = OpConstantComposite %v2int %int_1 %int_1
+; CHECK: %[[zeros:\w+]] = OpConstantComposite %v2int %int_0 %int_0
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%v2int") +
+      R"(; CHECK: %[[image:\w+]] = OpLoad %img %var
+; CHECK: %[[size:\w+]] = OpImageQuerySize %v2int %[[image]]
+; CHECK: %[[max:\w+]] = OpISub %v2int %[[size]] %[[ones]]
+; CHECK: %[[clamp:\w+]] = OpExtInst %v2int %[[glsl]] SClamp %coord %[[zeros]] %[[max]]
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %uint_0
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointer3D) {
+  const std::string text =
+      R"(; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+; CHECK: %[[ones:\w+]] = OpConstantComposite %v3int %int_1 %int_1 %int_1
+; CHECK: %[[zeros:\w+]] = OpConstantComposite %v3int %int_0 %int_0 %int_0
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 3D 0 0 0 2 R32ui", "%v3int") +
+      R"(; CHECK: %[[image:\w+]] = OpLoad %img %var
+; CHECK: %[[size:\w+]] = OpImageQuerySize %v3int %[[image]]
+; CHECK: %[[max:\w+]] = OpISub %v3int %[[size]] %[[ones]]
+; CHECK: %[[clamp:\w+]] = OpExtInst %v3int %[[glsl]] SClamp %coord %[[zeros]] %[[max]]
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %uint_0
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointer1DArray) {
+  // For an arrayed image, the last coordinate component is the layer index,
+  // and the size query reports the layer count in its last component.
+  const std::string text =
+      R"(OpCapability Sampled1D
+; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+; CHECK: %[[ones:\w+]] = OpConstantComposite %v2int %int_1 %int_1
+; CHECK: %[[zeros:\w+]] = OpConstantComposite %v2int %int_0 %int_0
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 1D 0 1 0 2 R32ui", "%v2int") +
+      R"(; CHECK: %[[image:\w+]] = OpLoad %img %var
+; CHECK: %[[size:\w+]] = OpImageQuerySize %v2int %[[image]]
+; CHECK: %[[max:\w+]] = OpISub %v2int %[[size]] %[[ones]]
+; CHECK: %[[clamp:\w+]] = OpExtInst %v2int %[[glsl]] SClamp %coord %[[zeros]] %[[max]]
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %uint_0
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointer2DArray) {
+  const std::string text =
+      R"(; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+; CHECK: %[[ones:\w+]] = OpConstantComposite %v3int %int_1 %int_1 %int_1
+; CHECK: %[[zeros:\w+]] = OpConstantComposite %v3int %int_0 %int_0 %int_0
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 2D 0 1 0 2 R32ui", "%v3int") +
+      R"(; CHECK: %[[image:\w+]] = OpLoad %img %var
+; CHECK: %[[size:\w+]] = OpImageQuerySize %v3int %[[image]]
+; CHECK: %[[max:\w+]] = OpISub %v3int %[[size]] %[[ones]]
+; CHECK: %[[clamp:\w+]] = OpExtInst %v3int %[[glsl]] SClamp %coord %[[zeros]] %[[max]]
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %uint_0
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointerCube) {
+  // For a cube, the coordinate has a third component for the face index,
+  // but the size query only reports width and height.  The face index is
+  // clamped to the constant 5.
+  const std::string text =
+      R"(; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+; CHECK: %[[ones:\w+]] = OpConstantComposite %v2int %int_1 %int_1
+; CHECK: %[[face_bound:\w+]] = OpConstantComposite %v2int %int_5 %int_0
+; CHECK: %[[zeros:\w+]] = OpConstantComposite %v3int %int_0 %int_0 %int_0
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint Cube 0 0 0 2 R32ui",
+                        "%v3int") +
+      R"(; CHECK: %[[image:\w+]] = OpLoad %img %var
+; CHECK: %[[size:\w+]] = OpImageQuerySize %v2int %[[image]]
+; CHECK: %[[max2:\w+]] = OpISub %v2int %[[size]] %[[ones]]
+; CHECK: %[[max3:\w+]] = OpVectorShuffle %v3int %[[max2]] %[[face_bound]] 0 1 2
+; CHECK: %[[clamp:\w+]] = OpExtInst %v3int %[[glsl]] SClamp %coord %[[zeros]] %[[max3]]
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %uint_0
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointerCubeArray) {
+  // For a cube array, the third coordinate component is 6 * layer + face,
+  // so the layer count from the size query is scaled by 6.
+  const std::string text =
+      R"(; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+; CHECK: %[[multiplicand:\w+]] = OpConstantComposite %v3int %int_1 %int_1 %int_6
+; CHECK: %[[ones:\w+]] = OpConstantComposite %v3int %int_1 %int_1 %int_1
+; CHECK: %[[zeros:\w+]] = OpConstantComposite %v3int %int_0 %int_0 %int_0
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint Cube 0 1 0 2 R32ui",
+                        "%v3int") +
+      R"(; CHECK: %[[image:\w+]] = OpLoad %img %var
+; CHECK: %[[size:\w+]] = OpImageQuerySize %v3int %[[image]]
+; CHECK: %[[scaled:\w+]] = OpIMul %v3int %[[size]] %[[multiplicand]]
+; CHECK: %[[max:\w+]] = OpISub %v3int %[[scaled]] %[[ones]]
+; CHECK: %[[clamp:\w+]] = OpExtInst %v3int %[[glsl]] SClamp %coord %[[zeros]] %[[max]]
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %uint_0
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointer2DMultisampled) {
+  // For a multisampled image, the sample index is clamped to one less than
+  // the sample count.
+  const std::string text =
+      R"(OpCapability StorageImageMultisample
+; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+; CHECK: %[[ones:\w+]] = OpConstantComposite %v2int %int_1 %int_1
+; CHECK: %[[zeros:\w+]] = OpConstantComposite %v2int %int_0 %int_0
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 2D 0 0 1 2 R32ui", "%v2int") +
+      R"(; CHECK: %[[image:\w+]] = OpLoad %img %var
+; CHECK: %[[size:\w+]] = OpImageQuerySize %v2int %[[image]]
+; CHECK: %[[max:\w+]] = OpISub %v2int %[[size]] %[[ones]]
+; CHECK: %[[clamp:\w+]] = OpExtInst %v2int %[[glsl]] SClamp %coord %[[zeros]] %[[max]]
+; CHECK: %[[samples:\w+]] = OpImageQuerySamples %uint %[[image]]
+; CHECK: %[[max_sample:\w+]] = OpISub %uint %[[samples]] %uint_1
+; CHECK: %[[clamp_sample:\w+]] = OpExtInst %uint %[[glsl]] SClamp %sample %uint_0 %[[max_sample]]
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %[[clamp_sample]]
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %sample
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointerConstantCoord) {
+  // A constant coordinate is still clamped against the image size, which is
+  // only known at runtime.
+  const std::string text =
+      R"(; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+; CHECK: %[[const_coord:\w+]] = OpConstantComposite %v2int %int_7 %int_9
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%v2int",
+                        "",
+                        R"(%int_7 = OpConstant %int 7
+%int_9 = OpConstant %int 9
+%const_coord = OpConstantComposite %v2int %int_7 %int_9
+)") +
+      // The %coord undef is unused; the texel pointer uses the constant.
+      R"(; CHECK: %[[clamp:\w+]] = OpExtInst %v2int %[[glsl]] SClamp %[[const_coord]] %
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %uint_0
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %const_coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointerNegativeConstantCoord) {
+  // A negative constant coordinate component is clamped up to zero by the
+  // injected clamp.
+  const std::string text =
+      R"(; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+; CHECK: %[[const_coord:\w+]] = OpConstantComposite %v2int %int_n1 %int_1
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%v2int",
+                        "",
+                        R"(%int_n1 = OpConstant %int -1
+%const_coord = OpConstantComposite %v2int %int_n1 %int_1
+)") +
+      R"(; CHECK: %[[clamp:\w+]] = OpExtInst %v2int %[[glsl]] SClamp %[[const_coord]] %
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %uint_0
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %const_coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest,
+       ImageTexelPointerNonMultisampledSampleForcedToZero) {
+  // The sample index of a non-multisampled image must be zero.  The pass
+  // forces it to zero even if the (invalid) module said otherwise.
+  const std::string text =
+      R"(; CHECK: OpCapability ImageQuery
+; CHECK: %[[glsl:\w+]] = OpExtInstImport "GLSL.std.450"
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%v2int") +
+      R"(; CHECK: %[[clamp:\w+]] = OpExtInst %v2int %[[glsl]] SClamp %coord %
+; CHECK: %texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %[[clamp]] %uint_0
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %uint_1
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointerExistingImageQueryCap) {
+  // The ImageQuery capability is not duplicated if it already exists.
+  const std::string text =
+      R"(OpCapability ImageQuery
+; CHECK: OpCapability ImageQuery
+; CHECK-NEXT: OpCapability Shader
+; CHECK-NOT: OpCapability
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%v2int") +
+      R"(%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndMatch<GraphicsRobustAccessPass>(text, true);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointerNonIntegerCoordFail) {
+  const std::string text =
+      R"(; CHECK: Coordinates for OpImageTexelPointer are not integral
+)" +
+      // Sneak a float coordinate past the (skipped) validator.
+      ShaderPreambleITP("%img = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%v2int",
+                        R"(%float = OpTypeFloat 32
+%v2float = OpTypeVector %float 2
+)") +
+      R"(%float_coord = OpUndef %v2float
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %float_coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndFail<GraphicsRobustAccessPass>(text);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointerBadComponentCountFail) {
+  const std::string text =
+      R"(; CHECK: Expected OpImageTexelPointer coordinate to have 2 components, but it has 1
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%int") +
+      R"(%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndFail<GraphicsRobustAccessPass>(text);
+}
+
+TEST_F(GraphicsRobustAccessTest, ImageTexelPointerWideCoordFail) {
+  const std::string text =
+      R"(; CHECK: Expected OpImageTexelPointer coordinate components to be 32-bits wide
+)" +
+      ShaderPreambleITP("%img = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%v2int",
+                        R"(%long = OpTypeInt 64 1
+%v2long = OpTypeVector %long 2
+)") +
+      R"(%long_coord = OpUndef %v2long
+%texel_ptr = OpImageTexelPointer %texel_ptr_ty %var %long_coord %uint_0
+)" +
+      MainSuffixITP();
+
+  SinglePassRunAndFail<GraphicsRobustAccessPass>(text);
+}
+
 
 TEST_F(GraphicsRobustAccessTest, ACRTArrayWithoutExistingUIntType) {
   SetTargetEnv(SPV_ENV_VULKAN_1_0);

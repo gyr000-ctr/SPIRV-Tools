@@ -125,7 +125,7 @@
 //        - Clamp the upper bound at the signed integer maximum.
 //        - Use SClamp for all clamping.
 //
-//    - TODO(dneto): OpImageTexelPointer:
+//    - OpImageTexelPointer:
 //      - Clamp coordinate to the image size returned by OpImageQuerySize
 //      - If multi-sampled, clamp the sample index to the count returned by
 //        OpImageQuerySamples.
@@ -694,6 +694,18 @@ Instruction* GraphicsRobustAccessPass::MakeUMinInst(
   return smin_inst;
 }
 
+namespace {
+// Returns the bit width of the integer scalar type, or of the component type
+// of the integer vector type, with the given type id.
+uint32_t GetIntWidth(const analysis::TypeManager& tm, uint32_t type_id) {
+  const analysis::Type* type = tm.GetType(type_id);
+  if (const auto* vector_type = type->AsVector()) {
+    type = vector_type->element_type();
+  }
+  return type->AsInteger()->width();
+}
+}  // namespace
+
 Instruction* GraphicsRobustAccessPass::MakeSClampInst(
     const analysis::TypeManager& tm, Instruction* x, Instruction* min,
     Instruction* max, Instruction* where) {
@@ -708,9 +720,9 @@ Instruction* GraphicsRobustAccessPass::MakeSClampInst(
   if (clamp_id == 0) {
     return nullptr;
   }
-  const auto xwidth = tm.GetType(x->type_id())->AsInteger()->width();
-  const auto minwidth = tm.GetType(min->type_id())->AsInteger()->width();
-  const auto maxwidth = tm.GetType(max->type_id())->AsInteger()->width();
+  const auto xwidth = GetIntWidth(tm, x->type_id());
+  const auto minwidth = GetIntWidth(tm, min->type_id());
+  const auto maxwidth = GetIntWidth(tm, max->type_id());
   assert(xwidth == minwidth);
   assert(xwidth == maxwidth);
   (void)xwidth;
@@ -876,24 +888,17 @@ Instruction* GraphicsRobustAccessPass::MakeRuntimeArrayLengthInst(
 
 spv_result_t GraphicsRobustAccessPass::ClampCoordinateForImageTexelPointer(
     opt::Instruction* image_texel_pointer) {
-  // TODO(dneto): Write tests for this code.
-  // TODO(dneto): Use signed-clamp
-  (void)(image_texel_pointer);
-  return SPV_SUCCESS;
-
-  // Do not compile this code until it is ready to be used.
-#if 0
   // Example:
   //   %texel_ptr = OpImageTexelPointer %texel_ptr_type %image_ptr %coord
   //   %sample
   //
-  // We want to clamp %coord components between vector-0 and the result
-  // of OpImageQuerySize acting on the underlying image.  So insert:
+  // We clamp %coord components between zero and the result of
+  // OpImageQuerySize acting on the underlying image.  So insert:
   //     %image = OpLoad %image_type %image_ptr
   //     %query_size = OpImageQuerySize %query_size_type %image
   //
-  // For a multi-sampled image, %sample is the sample index, and we need
-  // to clamp it between zero and the number of samples in the image.
+  // For a multi-sampled image, %sample is the sample index, and we clamp it
+  // between zero and the number of samples in the image, minus one:
   //     %sample_count = OpImageQuerySamples %uint %image
   //     %max_sample_index = OpISub %uint %sample_count %uint_1
   // For non-multi-sampled images, the sample index must be constant zero.
@@ -909,24 +914,16 @@ spv_result_t GraphicsRobustAccessPass::ClampCoordinateForImageTexelPointer(
   auto* coord = GetDef(image_texel_pointer->GetSingleWordInOperand(1));
   auto* samples = GetDef(image_texel_pointer->GetSingleWordInOperand(2));
 
-  // We will modify the module, at least by adding image query instructions.
-  module_status_.modified = true;
-
-  // Declare the ImageQuery capability if the module doesn't already have it.
-  auto* feature_mgr = context()->get_feature_mgr();
-  if (!feature_mgr->HasCapability(spv::Capability::ImageQuery)) {
-    auto cap = MakeUnique<Instruction>(
-        context(), spv::Op::OpCapability, 0, 0,
-        std::initializer_list<Operand>{
-            {SPV_OPERAND_TYPE_CAPABILITY, {spv::Capability::ImageQuery}}});
-    def_use_mgr->AnalyzeInstDefUse(cap.get());
-    context()->AddCapability(std::move(cap));
-    feature_mgr->Analyze(context()->module());
+  if (image_type->opcode() != spv::Op::OpTypeImage) {
+    return Fail() << "OpImageTexelPointer image pointer does not point to an "
+                     "image type: "
+                  << image_texel_pointer->PrettyPrint(
+                         SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES);
   }
 
   // OpImageTexelPointer is used to translate a coordinate and sample index
   // into an address for use with an atomic operation.  That is, it may only
-  // used with what Vulkan calls a "storage image"
+  // be used with what Vulkan calls a "storage image"
   // (OpTypeImage parameter Sampled=2).
   // Note: A storage image never has a level-of-detail associated with it.
 
@@ -934,85 +931,114 @@ spv_result_t GraphicsRobustAccessPass::ClampCoordinateForImageTexelPointer(
   //  - Only 2D images can be multi-sampled: OpTypeImage parameter MS=1
   //    only if Dim=2D.
   //  - Non-multi-sampled images (OpTypeImage parameter MS=0) must use
-  //    sample ID to a constant 0.
+  //    a sample ID of constant 0.
 
   // The coordinate is treated as unsigned, and should be clamped against the
   // image "size", returned by OpImageQuerySize. (Note: OpImageQuerySizeLod
   // is only usable with a sampled image, i.e. its image type has Sampled=1).
 
-  // Determine the result type for the OpImageQuerySize.
-  // For non-arrayed images:
-  //   non-Cube:
-  //     - Always the same as the coordinate type
-  //   Cube:
-  //     - Use all but the last component of the coordinate (which is the face
-  //       index from 0 to 5).
-  // For arrayed images (in Vulkan the Dim is 1D, 2D, or Cube):
-  //   non-Cube:
-  //     - A vector with the components in the coordinate, and one more for
-  //       the layer index.
-  //   Cube:
-  //     - The same as the coordinate type: 3-element integer vector.
-  //     - The third component from the size query is the layer count.
-  //     - The third component in the texel pointer calculation is
-  //       6 * layer + face, where 0 <= face < 6.
-  //   Cube: Use all but the last component of the coordinate (which is the face
-  //   index from 0 to 5).
-  const auto dim = SpvDim(image_type->GetSingleWordInOperand(1));
+  // Determine the number of components in the coordinate, and in the result
+  // of OpImageQuerySize.
+  //   Dim        coordinate components      query size components
+  //   1D         1 (+1 if arrayed)          1 (+1 if arrayed)
+  //   Buffer     1                          1
+  //   2D         2 (+1 if arrayed)          2 (+1 if arrayed)
+  //   3D         3                          3
+  //   Cube       3: (x, y, face)            2: (width, height)
+  //   Cube array 3: (x, y, 6*layer+face)    3: (width, height, layers)
+  const auto dim = spv::Dim(image_type->GetSingleWordInOperand(1));
   const bool arrayed = image_type->GetSingleWordInOperand(3) == 1;
   const bool multisampled = image_type->GetSingleWordInOperand(4) != 0;
-  const auto query_num_components = [dim, arrayed, this]() -> int {
-    const int arrayness_bonus = arrayed ? 1 : 0;
-    int num_coords = 0;
-    switch (dim) {
-      case spv::Dim::Buffer:
-      case SpvDim1D:
-        num_coords = 1;
-        break;
-      case spv::Dim::Cube:
-        // For cube, we need bounds for x, y, but not face.
-      case spv::Dim::Rect:
-      case SpvDim2D:
-        num_coords = 2;
-        break;
-      case SpvDim3D:
-        num_coords = 3;
-        break;
-      case spv::Dim::SubpassData:
-      case spv::Dim::Max:
-        return Fail() << "Invalid image dimension for OpImageTexelPointer: "
-                      << int(dim);
-        break;
+  uint32_t coord_num_components = 0;
+  uint32_t query_num_components = 0;
+  switch (dim) {
+    case spv::Dim::Dim1D:
+    case spv::Dim::Buffer:
+      coord_num_components = query_num_components = 1;
+      break;
+    case spv::Dim::Rect:
+    case spv::Dim::Dim2D:
+      coord_num_components = query_num_components = 2;
+      break;
+    case spv::Dim::Dim3D:
+      coord_num_components = query_num_components = 3;
+      break;
+    case spv::Dim::Cube:
+      // The last coordinate component is the face index, which does not
+      // participate in the size query.
+      coord_num_components = 3;
+      query_num_components = 2;
+      break;
+    default:
+      return Fail() << "Invalid image dimension for OpImageTexelPointer: "
+                    << uint32_t(dim);
+  }
+  if (arrayed) {
+    // The query size always gains a component for the layer count.  The
+    // coordinate gains a layer component too, except for cubes, where the
+    // layer is folded into the face component.
+    query_num_components += 1;
+    if (dim != spv::Dim::Cube) {
+      coord_num_components += 1;
     }
-    return num_coords + arrayness_bonus;
-  }();
-  const auto* coord_component_type = [type_mgr, coord]() {
-    const analysis::Type* coord_type = type_mgr->GetType(coord->type_id());
-    if (auto* vector_type = coord_type->AsVector()) {
-      return vector_type->element_type()->AsInteger();
-    }
-    return coord_type->AsInteger();
-  }();
-  // For now, only handle 32-bit case for coordinates.
-  if (!coord_component_type) {
-    return Fail() << " Coordinates for OpImageTexelPointer are not integral: "
+  }
+
+  const analysis::Type* coord_type = type_mgr->GetType(coord->type_id());
+  const analysis::Type* coord_component_type = coord_type;
+  uint32_t actual_coord_components = 1;
+  if (auto* vector_type = coord_type->AsVector()) {
+    coord_component_type = vector_type->element_type();
+    actual_coord_components = vector_type->element_count();
+  }
+  const auto* coord_int_type = coord_component_type->AsInteger();
+  if (!coord_int_type) {
+    return Fail() << "Coordinates for OpImageTexelPointer are not integral: "
                   << image_texel_pointer->PrettyPrint(
                          SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES);
   }
-  if (coord_component_type->width() != 32) {
-    return Fail() << " Expected OpImageTexelPointer coordinate components to "
+  // For now, only handle the 32-bit case for coordinates.  (The validator
+  // already enforces this.)
+  if (coord_int_type->width() != 32) {
+    return Fail() << "Expected OpImageTexelPointer coordinate components to "
                      "be 32-bits wide. They are "
-                  << coord_component_type->width() << " bits. "
+                  << coord_int_type->width() << " bits. "
                   << image_texel_pointer->PrettyPrint(
                          SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES);
   }
-  const auto* query_size_type =
-      [type_mgr, coord_component_type,
-       query_num_components]() -> const analysis::Type* {
-    if (query_num_components == 1) return coord_component_type;
-    analysis::Vector proposed(coord_component_type, query_num_components);
-    return type_mgr->GetRegisteredType(&proposed);
-  }();
+  if (actual_coord_components != coord_num_components) {
+    return Fail() << "Expected OpImageTexelPointer coordinate to have "
+                  << coord_num_components << " components, but it has "
+                  << actual_coord_components << ": "
+                  << image_texel_pointer->PrettyPrint(
+                         SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES);
+  }
+  const auto* sample_type = type_mgr->GetType(samples->type_id())->AsInteger();
+  if (!sample_type || sample_type->width() != 32) {
+    return Fail() << "Expected OpImageTexelPointer sample index to be a "
+                     "32-bit integer: "
+                  << image_texel_pointer->PrettyPrint(
+                         SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES);
+  }
+
+  // We will modify the module, at least by adding image query instructions.
+  module_status_.modified = true;
+
+  // Declare the ImageQuery capability if the module doesn't already have it.
+  context()->AddCapability(spv::Capability::ImageQuery);
+
+  // The result type of the OpImageQuerySize instruction.  Its component type
+  // matches the coordinate component type, so the subsequent clamp operates
+  // on a single type throughout.
+  const analysis::Type* query_size_type = coord_int_type;
+  if (query_num_components > 1) {
+    analysis::Vector proposed(coord_int_type, query_num_components);
+    query_size_type = type_mgr->GetRegisteredType(&proposed);
+  }
+  const uint32_t query_size_type_id =
+      type_mgr->GetTypeInstruction(query_size_type);
+  if (query_size_type_id == 0) {
+    return Fail();
+  }
 
   const uint32_t image_id = context()->TakeNextId();
   if (image_id == 0) {
@@ -1028,117 +1054,185 @@ spv_result_t GraphicsRobustAccessPass::ClampCoordinateForImageTexelPointer(
   }
   auto* query_size =
       InsertInst(image_texel_pointer, spv::Op::OpImageQuerySize,
-                 type_mgr->GetTypeInstruction(query_size_type), query_size_id,
+                 query_size_type_id, query_size_id,
                  {{SPV_OPERAND_TYPE_ID, {image->result_id()}}});
 
-  auto* component_1 = constant_mgr->GetConstant(coord_component_type, {1});
-  const uint32_t component_1_id =
-      constant_mgr->GetDefiningInstruction(component_1)->result_id();
-  auto* component_0 = constant_mgr->GetConstant(coord_component_type, {0});
-  const uint32_t component_0_id =
-      constant_mgr->GetDefiningInstruction(component_0)->result_id();
+  auto* component_0_inst = constant_mgr->GetDefiningInstruction(
+      constant_mgr->GetConstant(coord_int_type, {0}));
+  auto* component_1_inst = constant_mgr->GetDefiningInstruction(
+      constant_mgr->GetConstant(coord_int_type, {1}));
+  if (!component_0_inst || !component_1_inst) {
+    return Fail();
+  }
 
   // If the image is a cube array, then the last component of the queried
-  // size is the layer count.  In the query, we have to accommodate folding
-  // in the face index ranging from 0 through 5. The inclusive upper bound
-  // on the third coordinate therefore is multiplied by 6.
-  auto* query_size_including_faces = query_size;
+  // size is the layer count.  In the texel pointer calculation, the layer
+  // is folded into the face index ranging from 0 through 5.  The inclusive
+  // upper bound on the third coordinate therefore is multiplied by 6.
+  Instruction* query_size_including_faces = query_size;
   if (arrayed && (dim == spv::Dim::Cube)) {
-    // Multiply the last coordinate by 6.
-    auto* component_6 = constant_mgr->GetConstant(coord_component_type, {6});
-    const uint32_t component_6_id =
-        constant_mgr->GetDefiningInstruction(component_6)->result_id();
-    assert(query_num_components == 3);
+    auto* component_6_inst = constant_mgr->GetDefiningInstruction(
+        constant_mgr->GetConstant(coord_int_type, {6}));
+    if (!component_6_inst) {
+      return Fail();
+    }
     auto* multiplicand = constant_mgr->GetConstant(
-        query_size_type, {component_1_id, component_1_id, component_6_id});
+        query_size_type,
+        {component_1_inst->result_id(), component_1_inst->result_id(),
+         component_6_inst->result_id()});
     auto* multiplicand_inst =
         constant_mgr->GetDefiningInstruction(multiplicand);
-    const auto query_size_including_faces_id = context()->TakeNextId();
-    if (query_size_including_faces_id == 0) {
+    if (!multiplicand_inst) {
+      return Fail();
+    }
+    const uint32_t scaled_size_id = context()->TakeNextId();
+    if (scaled_size_id == 0) {
       return Fail();
     }
     query_size_including_faces = InsertInst(
-        image_texel_pointer, spv::Op::OpIMul,
-        type_mgr->GetTypeInstruction(query_size_type),
-        query_size_including_faces_id,
-        {{SPV_OPERAND_TYPE_ID, {query_size_including_faces->result_id()}},
+        image_texel_pointer, spv::Op::OpIMul, query_size_type_id,
+        scaled_size_id,
+        {{SPV_OPERAND_TYPE_ID, {query_size->result_id()}},
          {SPV_OPERAND_TYPE_ID, {multiplicand_inst->result_id()}}});
   }
 
-  // Make a coordinate-type with all 1 components.
-  auto* coordinate_1 =
-      query_num_components == 1
-          ? component_1
-          : constant_mgr->GetConstant(
-                query_size_type,
-                std::vector<uint32_t>(query_num_components, component_1_id));
-  // Make a coordinate-type with all 1 components.
-  auto* coordinate_0 =
-      query_num_components == 0
-          ? component_0
-          : constant_mgr->GetConstant(
-                query_size_type,
-                std::vector<uint32_t>(query_num_components, component_0_id));
-
-  const uint32_t query_max_including_faces_id = context()->TakeNextId();
-  if (query_max_including_faces_id == 0) {
+  // Make a query-size-typed constant with all 1 components, and subtract it
+  // to get the inclusive upper bound for each coordinate component.
+  auto* size_1 = query_num_components == 1
+                     ? constant_mgr->GetConstant(coord_int_type, {1})
+                     : constant_mgr->GetConstant(
+                           query_size_type,
+                           std::vector<uint32_t>(
+                               query_num_components,
+                               component_1_inst->result_id()));
+  auto* size_1_inst = constant_mgr->GetDefiningInstruction(size_1);
+  if (!size_1_inst) {
     return Fail();
   }
-  auto* query_max_including_faces = InsertInst(
-      image_texel_pointer, spv::Op::OpISub,
-      type_mgr->GetTypeInstruction(query_size_type),
-      query_max_including_faces_id,
+  const uint32_t query_max_id = context()->TakeNextId();
+  if (query_max_id == 0) {
+    return Fail();
+  }
+  auto* query_max = InsertInst(
+      image_texel_pointer, spv::Op::OpISub, query_size_type_id, query_max_id,
       {{SPV_OPERAND_TYPE_ID, {query_size_including_faces->result_id()}},
-       {SPV_OPERAND_TYPE_ID,
-        {constant_mgr->GetDefiningInstruction(coordinate_1)->result_id()}}});
+       {SPV_OPERAND_TYPE_ID, {size_1_inst->result_id()}}});
 
-  // Clamp the coordinate
-  auto* clamp_coord = MakeSClampInst(
-      *type_mgr, coord, constant_mgr->GetDefiningInstruction(coordinate_0),
-      query_max_including_faces, image_texel_pointer);
+  // Adapt the upper bound to the coordinate type.  This only differs for a
+  // non-arrayed cube, where the coordinate has a face component that the
+  // size query does not provide.  A face index is bounded by 5.
+  Instruction* max_bound = query_max;
+  if (query_num_components != coord_num_components) {
+    assert(dim == spv::Dim::Cube && !arrayed);
+    auto* component_5_inst = constant_mgr->GetDefiningInstruction(
+        constant_mgr->GetConstant(coord_int_type, {5}));
+    if (!component_5_inst) {
+      return Fail();
+    }
+    analysis::Vector vec2_proposed(coord_int_type, 2);
+    auto* face_bound = constant_mgr->GetConstant(
+        type_mgr->GetRegisteredType(&vec2_proposed),
+        {component_5_inst->result_id(), component_0_inst->result_id()});
+    auto* face_bound_inst = constant_mgr->GetDefiningInstruction(face_bound);
+    if (!face_bound_inst) {
+      return Fail();
+    }
+    const uint32_t coord_type_id = type_mgr->GetTypeInstruction(coord_type);
+    if (coord_type_id == 0) {
+      return Fail();
+    }
+    const uint32_t max_bound_id = context()->TakeNextId();
+    if (max_bound_id == 0) {
+      return Fail();
+    }
+    max_bound = InsertInst(
+        image_texel_pointer, spv::Op::OpVectorShuffle, coord_type_id,
+        max_bound_id,
+        {{SPV_OPERAND_TYPE_ID, {query_max->result_id()}},
+         {SPV_OPERAND_TYPE_ID, {face_bound_inst->result_id()}},
+         {SPV_OPERAND_TYPE_LITERAL_INTEGER, {0}},
+         {SPV_OPERAND_TYPE_LITERAL_INTEGER, {1}},
+         {SPV_OPERAND_TYPE_LITERAL_INTEGER, {2}}});
+  }
+
+  // Make a coordinate-typed constant with all 0 components.
+  auto* coordinate_0 = coord_num_components == 1
+                           ? constant_mgr->GetConstant(coord_int_type, {0})
+                           : constant_mgr->GetConstant(
+                                 coord_type,
+                                 std::vector<uint32_t>(
+                                     coord_num_components,
+                                     component_0_inst->result_id()));
+  auto* coordinate_0_inst = constant_mgr->GetDefiningInstruction(coordinate_0);
+  if (!coordinate_0_inst) {
+    return Fail();
+  }
+
+  // Clamp the coordinate.
+  auto* clamp_coord = MakeSClampInst(*type_mgr, coord, coordinate_0_inst,
+                                     max_bound, image_texel_pointer);
   if (clamp_coord == nullptr) {
     return Fail();
   }
   image_texel_pointer->SetInOperand(1, {clamp_coord->result_id()});
 
-  // Clamp the sample index
   if (multisampled) {
-    // Get the sample count via OpImageQuerySamples
-    const auto query_samples_id = context()->TakeNextId();
+    // Clamp the sample index to one less than the sample count, as returned
+    // by OpImageQuerySamples.
+    const uint32_t sample_type_id = type_mgr->GetTypeInstruction(sample_type);
+    if (sample_type_id == 0) {
+      return Fail();
+    }
+    const uint32_t query_samples_id = context()->TakeNextId();
     if (query_samples_id == 0) {
       return Fail();
     }
     auto* query_samples = InsertInst(
-        image_texel_pointer, spv::Op::OpImageQuerySamples,
-        constant_mgr->GetDefiningInstruction(component_0)->type_id(),
+        image_texel_pointer, spv::Op::OpImageQuerySamples, sample_type_id,
         query_samples_id, {{SPV_OPERAND_TYPE_ID, {image->result_id()}}});
 
-    const auto max_samples_id = context()->TakeNextId();
+    auto* sample_1_inst = constant_mgr->GetDefiningInstruction(
+        constant_mgr->GetConstant(sample_type, {1}));
+    if (!sample_1_inst) {
+      return Fail();
+    }
+    const uint32_t max_samples_id = context()->TakeNextId();
     if (max_samples_id == 0) {
       return Fail();
     }
-    auto* max_samples = InsertInst(image_texel_pointer, spv::Op::OpImageQuerySamples,
-                                   query_samples->type_id(), max_samples_id,
-                                   {{SPV_OPERAND_TYPE_ID, {query_samples_id}},
-                                    {SPV_OPERAND_TYPE_ID, {component_1_id}}});
+    auto* max_samples = InsertInst(
+        image_texel_pointer, spv::Op::OpISub, query_samples->type_id(),
+        max_samples_id,
+        {{SPV_OPERAND_TYPE_ID, {query_samples->result_id()}},
+         {SPV_OPERAND_TYPE_ID, {sample_1_inst->result_id()}}});
 
-    auto* clamp_samples = MakeSClampInst(
-        *type_mgr, samples, constant_mgr->GetDefiningInstruction(coordinate_0),
-        max_samples, image_texel_pointer);
+    auto* sample_0_inst = constant_mgr->GetDefiningInstruction(
+        constant_mgr->GetConstant(sample_type, {0}));
+    if (!sample_0_inst) {
+      return Fail();
+    }
+    auto* clamp_samples = MakeSClampInst(*type_mgr, samples, sample_0_inst,
+                                         max_samples, image_texel_pointer);
     if (clamp_samples == nullptr) {
       return Fail();
     }
     image_texel_pointer->SetInOperand(2, {clamp_samples->result_id()});
-
   } else {
-    // Just replace it with 0.  Don't even check what was there before.
-    image_texel_pointer->SetInOperand(2, {component_0_id});
+    // The sample index must be constant zero.  Force it, in case the module
+    // has not been validated.
+    auto* sample_0_inst = constant_mgr->GetDefiningInstruction(
+        constant_mgr->GetConstant(sample_type, {0}));
+    if (!sample_0_inst) {
+      return Fail();
+    }
+    if (samples->result_id() != sample_0_inst->result_id()) {
+      image_texel_pointer->SetInOperand(2, {sample_0_inst->result_id()});
+    }
   }
 
   def_use_mgr->AnalyzeInstUse(image_texel_pointer);
 
   return SPV_SUCCESS;
-#endif
 }
 
 opt::Instruction* GraphicsRobustAccessPass::InsertInst(
